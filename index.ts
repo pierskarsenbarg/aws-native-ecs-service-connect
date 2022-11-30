@@ -1,6 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsx from "@pulumi/awsx";
+import { TopicRule } from "@pulumi/aws/iot";
 
 const vpc = new awsx.ec2.Vpc("vpc", {
     cidrBlock: "10.0.0.0/16",
@@ -17,12 +18,12 @@ const vpc = new awsx.ec2.Vpc("vpc", {
     }
 });
 
-// const repo = new awsx.ecr.Repository("repo");
+const repo = new awsx.ecr.Repository("repo");
 
-// const image = new awsx.ecr.Image("app-image", {
-//     repositoryUrl: repo.url,
-//     path: "./app"
-// })
+const image = new awsx.ecr.Image("app-image", {
+    repositoryUrl: repo.url,
+    path: "./app"
+})
 
 const cluster = new aws.ecs.Cluster("pk-cluster");
 
@@ -46,8 +47,8 @@ const taskSecurityGroup = new aws.ec2.SecurityGroup("taskSg", {
     vpcId: vpc.vpcId,
     ingress: [{
         protocol: "tcp",
-        fromPort: 80,
-        toPort: 80,
+        fromPort: 3000,
+        toPort: 3000,
         securityGroups: [lbSecurityGroup.id]
     }],
     egress: [{
@@ -64,10 +65,20 @@ const lb = new aws.lb.LoadBalancer("lb", {
 });
 
 const tg = new aws.lb.TargetGroup("tg", {
-    port: 80,
+    port: 3000,
     protocol: "HTTP",
     targetType: "ip",
     vpcId: vpc.vpcId,
+    healthCheck: {
+        enabled: true,
+        interval: 5,
+        healthyThreshold: 2,
+        path: "/health",
+        protocol: "http",
+        port: "3000",
+        timeout: 4
+    },
+    deregistrationDelay: 5
 });
 
 const listener = new aws.lb.Listener("listener", {
@@ -84,70 +95,56 @@ const role = new aws.iam.Role("role", {
     managedPolicyArns: [aws.iam.ManagedPolicy.AmazonECSTaskExecutionRolePolicy]
 });
 
-// const appTaskDefinition = new aws.ecs.TaskDefinition("appTd", {
-//     family: "app-demo",
+const logGroup = new aws.cloudwatch.LogGroup("app-loggroup");
+
+const appTaskDefinition = new aws.ecs.TaskDefinition("appTd", {
+    family: "app-demo",
+    cpu: "256",
+    memory: "512",
+    networkMode: "awsvpc",
+    requiresCompatibilities: ["FARGATE"],
+    executionRoleArn: role.arn,
+    taskRoleArn: role.arn,
+    containerDefinitions: pulumi.all([image.imageUri, logGroup.name]).apply(([imageUri, logGroupName]) => JSON.stringify([{
+        name: "app",
+        image: imageUri,
+        portMappings: [{
+            containerPort: 3000,
+            hostPort: 3000,
+            protocol: "tcp"
+        }],
+        logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+                "awslogs-create-group": "true",
+                "awslogs-group": logGroupName,
+                "awslogs-region": "eu-west-1",
+                "awslogs-stream-prefix": "app"
+            }
+        },
+    }]))
+});
+
+// const taskdefinition = new aws.ecs.TaskDefinition("td", {
+//     family: "ecs-connect",
 //     cpu: "256",
 //     memory: "512",
 //     networkMode: "awsvpc",
 //     requiresCompatibilities: ["FARGATE"],
 //     executionRoleArn: role.arn,
 //     containerDefinitions: JSON.stringify([{
-//         name: "app",
-//         image: image.imageUri,
+//         name: "nginx",
+//         image: "nginx:latest",
 //         portMappings: [{
-//             containerPort: 3000,
+//             containerPort: 80,
 //             hostPort: 80,
 //             protocol: "tcp"
 //         }],
-//         logConfiguration: {
-//             logDriver: "awslogs",
-//             options: {
-//                 "awslogs-create-group": "true",
-//                 "awslogs-group": "nginx-fargate",
-//                 "awslogs-region": "eu-west-1",
-//                 "awslogs-stream-prefix": "nginx"
-//             }
-//         },
+        
 //     }])
 // });
 
-const taskdefinition = new aws.ecs.TaskDefinition("td", {
-    family: "ecs-connect",
-    cpu: "256",
-    memory: "512",
-    networkMode: "awsvpc",
-    requiresCompatibilities: ["FARGATE"],
-    executionRoleArn: role.arn,
-    containerDefinitions: JSON.stringify([{
-        name: "nginx",
-        image: "nginx:latest",
-        portMappings: [{
-            containerPort: 80,
-            hostPort: 80,
-            protocol: "tcp"
-        }],
-        
-    }])
-});
-
-const service = new aws.ecs.Service("service", {
-    cluster: cluster.arn,
-    desiredCount: 1,
-    launchType: "FARGATE",
-    taskDefinition: taskdefinition.arn,
-    networkConfiguration: {
-        assignPublicIp: true,
-        subnets: vpc.publicSubnetIds,
-        securityGroups: [taskSecurityGroup.id]
-    },
-    loadBalancers: [{
-        targetGroupArn: tg.arn,
-        containerName: "nginx",
-        containerPort: 80
-    }],
-}, {dependsOn: [listener]});
-
-// const appService = new aws.ecs.Service("app-service", {
+// const service = new aws.ecs.Service("service", {
 //     cluster: cluster.arn,
 //     desiredCount: 1,
 //     launchType: "FARGATE",
@@ -157,7 +154,30 @@ const service = new aws.ecs.Service("service", {
 //         subnets: vpc.publicSubnetIds,
 //         securityGroups: [taskSecurityGroup.id]
 //     },
-//     loadBalancers
-// })
+//     loadBalancers: [{
+//         targetGroupArn: tg.arn,
+//         containerName: "app",
+//         containerPort: 3000
+//     }],
+// }, {dependsOn: [listener]});
+
+const appService = new aws.ecs.Service("app-service", {
+    cluster: cluster.arn,
+    desiredCount: 1,
+    launchType: "FARGATE",
+    taskDefinition: appTaskDefinition.arn,
+    networkConfiguration: {
+        assignPublicIp: true,
+        subnets: vpc.publicSubnetIds,
+        securityGroups: [taskSecurityGroup.id]
+    },
+    loadBalancers: [{
+        targetGroupArn: tg.arn,
+        containerName: "app",
+        containerPort: 3000
+    }],
+    deploymentMinimumHealthyPercent: 100,
+    deploymentMaximumPercent: 200
+});
 
 export const url = lb.dnsName;
