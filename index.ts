@@ -1,7 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsx from "@pulumi/awsx";
-import { TopicRule } from "@pulumi/aws/iot";
+import * as awsNative from "@pulumi/aws-native";
 
 const vpc = new awsx.ec2.Vpc("vpc", {
     cidrBlock: "10.0.0.0/16",
@@ -25,7 +25,11 @@ const image = new awsx.ecr.Image("app-image", {
     path: "./app"
 })
 
-const cluster = new aws.ecs.Cluster("pk-cluster");
+const cluster2 = new awsNative.ecs.Cluster("pk-native-cluster", {
+    serviceConnectDefaults: {
+        namespace: "native-app"
+    }
+});
 
 const lbSecurityGroup = new aws.ec2.SecurityGroup("lbSg", {
     vpcId: vpc.vpcId,
@@ -57,6 +61,22 @@ const taskSecurityGroup = new aws.ec2.SecurityGroup("taskSg", {
         toPort: 0,
         cidrBlocks: ["0.0.0.0/0"]
     }]
+});
+
+const redisSecurityGroup = new aws.ec2.SecurityGroup("redisSg", {
+    vpcId: vpc.vpcId,
+    ingress: [{
+        protocol: "tcp",
+        fromPort: 6379,
+        toPort: 6379,
+        securityGroups: [taskSecurityGroup.id]
+    }],
+    egress: [{
+        protocol: "-1",
+        fromPort: 0,
+        toPort: 0,
+        cidrBlocks: ["0.0.0.0/0"]
+    }]
 })
 
 const lb = new aws.lb.LoadBalancer("lb", {
@@ -74,12 +94,12 @@ const tg = new aws.lb.TargetGroup("tg", {
         interval: 5,
         healthyThreshold: 2,
         path: "/health",
-        protocol: "http",
+        protocol: "HTTP",
         port: "3000",
         timeout: 4
     },
     deregistrationDelay: 5
-});
+}, {dependsOn: [lb]});
 
 const listener = new aws.lb.Listener("listener", {
     loadBalancerArn: lb.arn,
@@ -97,7 +117,7 @@ const role = new aws.iam.Role("role", {
 
 const logGroup = new aws.cloudwatch.LogGroup("app-loggroup");
 
-const appTaskDefinition = new aws.ecs.TaskDefinition("appTd", {
+const appTaskDefinitionWithEnvVar = new awsNative.ecs.TaskDefinition("appTdEnvVar", {
     family: "app-demo",
     cpu: "256",
     memory: "512",
@@ -105,79 +125,125 @@ const appTaskDefinition = new aws.ecs.TaskDefinition("appTd", {
     requiresCompatibilities: ["FARGATE"],
     executionRoleArn: role.arn,
     taskRoleArn: role.arn,
-    containerDefinitions: pulumi.all([image.imageUri, logGroup.name]).apply(([imageUri, logGroupName]) => JSON.stringify([{
+    containerDefinitions: [{
         name: "app",
-        image: imageUri,
+        image: image.imageUri,
         portMappings: [{
             containerPort: 3000,
-            hostPort: 3000,
-            protocol: "tcp"
+            protocol: "tcp",
+            name: "app-port"
         }],
         logConfiguration: {
             logDriver: "awslogs",
             options: {
                 "awslogs-create-group": "true",
-                "awslogs-group": logGroupName,
+                "awslogs-group": logGroup.name,
                 "awslogs-region": "eu-west-1",
                 "awslogs-stream-prefix": "app"
             }
         },
-    }]))
-});
+        environment: [
+            {
+                name: "REDIS_PORT",
+                value: "6379"
+            },
+            {
+                name: "REDIS_HOST",
+                value: "redis"
+            }
+        ]
+    }]
+}, {replaceOnChanges: ["containerDefinitions"]});
 
-// const taskdefinition = new aws.ecs.TaskDefinition("td", {
-//     family: "ecs-connect",
-//     cpu: "256",
-//     memory: "512",
-//     networkMode: "awsvpc",
-//     requiresCompatibilities: ["FARGATE"],
-//     executionRoleArn: role.arn,
-//     containerDefinitions: JSON.stringify([{
-//         name: "nginx",
-//         image: "nginx:latest",
-//         portMappings: [{
-//             containerPort: 80,
-//             hostPort: 80,
-//             protocol: "tcp"
-//         }],
-        
-//     }])
-// });
+const redisTaskDefinition = new awsNative.ecs.TaskDefinition("redisTd", {
+    family: "redis-demo",
+    cpu: "256",
+    memory: "512",
+    networkMode: "awsvpc",
+    requiresCompatibilities: ["FARGATE"],
+    executionRoleArn: role.arn,
+    taskRoleArn: role.arn,
+    containerDefinitions: [{
+        name: "redis",
+        image: "redis:latest",
+        portMappings: [{
+            containerPort: 6379,
+            protocol: "tcp",
+            name: "redis-port"
+        }],
+        logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+                "awslogs-create-group": "true",
+                "awslogs-group": logGroup.name,
+                "awslogs-region": "eu-west-1",
+                "awslogs-stream-prefix": "redis"
+            }
+        },
+    }]
+})
 
-// const service = new aws.ecs.Service("service", {
-//     cluster: cluster.arn,
-//     desiredCount: 1,
-//     launchType: "FARGATE",
-//     taskDefinition: appTaskDefinition.arn,
-//     networkConfiguration: {
-//         assignPublicIp: true,
-//         subnets: vpc.publicSubnetIds,
-//         securityGroups: [taskSecurityGroup.id]
-//     },
-//     loadBalancers: [{
-//         targetGroupArn: tg.arn,
-//         containerName: "app",
-//         containerPort: 3000
-//     }],
-// }, {dependsOn: [listener]});
-
-const appService = new aws.ecs.Service("app-service", {
-    cluster: cluster.arn,
+const nativeAppService = new awsNative.ecs.Service("native-app-service", {
+    cluster: cluster2.arn,
     desiredCount: 1,
     launchType: "FARGATE",
-    taskDefinition: appTaskDefinition.arn,
+    taskDefinition: appTaskDefinitionWithEnvVar.taskDefinitionArn,
     networkConfiguration: {
-        assignPublicIp: true,
-        subnets: vpc.publicSubnetIds,
-        securityGroups: [taskSecurityGroup.id]
+        awsvpcConfiguration: {
+            assignPublicIp: awsNative.ecs.ServiceAwsVpcConfigurationAssignPublicIp.Enabled,
+            subnets: vpc.publicSubnetIds,
+            securityGroups: [taskSecurityGroup.id]
+        }
     },
     loadBalancers: [{
-        targetGroupArn: tg.arn,
         containerName: "app",
-        containerPort: 3000
+        containerPort: 3000,
+        targetGroupArn: tg.arn
     }],
-    deploymentMinimumHealthyPercent: 100,
-    deploymentMaximumPercent: 200
+    deploymentConfiguration: {
+        maximumPercent: 200,
+        minimumHealthyPercent: 100
+    },
+    serviceConnectConfiguration: {
+        enabled: true,
+        namespace: "native-app",
+        services: [{
+            portName: "app-port",
+            clientAliases: [{
+                port: 3000,
+                dnsName: "app"
+            }]
+        }],
+    }
 });
+
+const redisService = new awsNative.ecs.Service("redis-service", {
+    cluster: cluster2.arn,
+    desiredCount: 1,
+    launchType: "FARGATE",
+    taskDefinition: redisTaskDefinition.taskDefinitionArn,
+    networkConfiguration: {
+        awsvpcConfiguration: {
+            assignPublicIp: awsNative.ecs.ServiceAwsVpcConfigurationAssignPublicIp.Enabled,
+            subnets: vpc.publicSubnetIds,
+            securityGroups: [redisSecurityGroup.id]
+        }
+    },
+    deploymentConfiguration: {
+        maximumPercent: 200,
+        minimumHealthyPercent: 100
+    },
+    serviceConnectConfiguration: {
+        enabled: true,
+        namespace: "native-app",
+        services: [{
+            portName: "redis-port",
+            clientAliases: [{
+                port: 6379,
+                dnsName: "redis"
+            }]
+        }],
+    }
+})
 
 export const url = lb.dnsName;

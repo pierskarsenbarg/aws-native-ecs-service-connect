@@ -1,45 +1,45 @@
-const express = require("express");
-const redis = require("redis");
+import express from "express";
+import { createClient } from "redis";
 
 const app = express();
-const redisPort = process.env.REDIS_PORT
+const redisPort = process.env.REDIS_PORT;
 const redisHost = process.env.REDIS_HOST;
-const redisClient = redis.createClient(redisPort, redisHost);
+const redisUrl = `redis://${redisHost}:${redisPort}`;
+const redisClient = createClient({
+  url: redisUrl
+});
+await redisClient.connect();
 const redisKey = "hits";
 
 app.get("/", (req, res) => {
-    // redisClient.get(redisKey, async (err, redisData) => {
-        console.log("Request started")
-        res.send("foobar");
-        // if(err) {
-        //     res.send(`Error: ${err}`)
-        // };
-
-        // if(redisData) {
-        //     console.log(redisData);
-        //     let jsonData = JSON.parse(redisData);
-        //     let currentVisits = jsonData.num;
-        //     let data = {num: currentVisits + 1};
-        //     redisClient.set(redisKey, JSON.stringify(data));
-        //     res.send(`I have been viewed ${currentVisits} times.`);
-        // } else {
-        //     let data = {num: 1};
-        //     redisClient.set(redisKey, JSON.stringify(data));
-        //     res.send(`I have been viewed ${data.num} time.`)
-        // }
-    // })
+  console.log("Request started");
+  redisClient
+    .get(redisKey)
+    .then((redisData) => {
+      if (redisData) {
+        console.log(redisData);
+        let jsonData = JSON.parse(redisData);
+        let currentVisits = jsonData.num + 1;
+        let data = { num: currentVisits };
+        redisClient.set(redisKey, JSON.stringify(data));
+        res.send(`I have been viewed ${currentVisits} times.`);
+      } else {
+        let data = { num: 1 };
+        redisClient.set(redisKey, JSON.stringify(data));
+        res.send(`I have been viewed ${data.num} time.`);
+      }
+    })
+    .catch((err) => {
+        console.log(err)
+        res.status(500).send("Sorry, there's been a problem")});
 });
 
-app.get("/health", (req,res) => {
-    res.send("Ok");
+app.get("/health", (req, res) => {
+  res.send("Ok");
 });
-
-// app.get('/', (req, res) => {
-//     res.send('Hello World!')
-// });
 
 app.listen(3000, () => {
-    console.log("Node server started");
-    // console.log(`Redis Host: ${redisHost}`);
-    // console.log(`Redis Port: ${redisPort}`);
+  console.log("Node server started");
+  console.log(`Redis Host: ${redisHost}`);
+  console.log(`Redis Port: ${redisPort}`);
 });
